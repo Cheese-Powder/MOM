@@ -69,6 +69,3 @@ mvn compile exec:java "-Dmaven.repo.local=%TEMP%\mom-m2-repo" -Dexec.mainClass=o
 | `mom.analysis.fanout` | 分析服务 → 仪表盘（周期统计）      |
 | `mom.alerts.fanout`   | 分析服务 → 仪表盘（严重告警）      |
 
-## 作业打包提示
-
-按课程要求将源码与设计报告打包为：`第2次作业+学号+姓名.zip`，在截止日期前上传智课平台。
