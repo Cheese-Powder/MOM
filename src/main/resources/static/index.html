@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>分布式日志监控</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+    <style>
+        :root {
+            --bg: #0f1419;
+            --card: #1a2332;
+            --text: #e7ecf3;
+            --muted: #8b9cb3;
+            --accent: #3d8bfd;
+            --danger: #f85149;
+            --warn: #d29922;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: "Segoe UI", system-ui, sans-serif;
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        header {
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #2d3848;
+            background: linear-gradient(180deg, #151c28 0%, var(--bg) 100%);
+        }
+        header h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
+        header .meta { color: var(--muted); font-size: 0.85rem; margin-top: 0.35rem; }
+        #conn { font-weight: 600; }
+        .conn-ok { color: #3fb950; }
+        .conn-bad { color: var(--danger); }
+        main { padding: 1rem 1.5rem 2rem; max-width: 1400px; margin: 0 auto; }
+        .global-stats {
+            display: flex; gap: 1rem; flex-wrap: wrap;
+            margin-bottom: 1.25rem;
+        }
+        .pill {
+            background: var(--card);
+            border-radius: 8px;
+            padding: 0.65rem 1rem;
+            border: 1px solid #2d3848;
+            font-size: 0.9rem;
+        }
+        .pill strong { color: var(--accent); }
+        .devices { display: grid; gap: 1.25rem; }
+        .device-card {
+            background: var(--card);
+            border-radius: 12px;
+            border: 1px solid #2d3848;
+            padding: 1rem 1.25rem;
+        }
+        .device-card h2 {
+            margin: 0 0 0.75rem;
+            font-size: 1.05rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .badge {
+            font-size: 0.7rem;
+            padding: 0.15rem 0.45rem;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+        .badge-on { background: rgba(248, 81, 73, 0.2); color: var(--danger); }
+        .badge-off { background: rgba(139, 156, 179, 0.15); color: var(--muted); }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+        .stat {
+            background: #121922;
+            border-radius: 8px;
+            padding: 0.5rem 0.75rem;
+            font-size: 0.85rem;
+        }
+        .stat label { display: block; color: var(--muted); font-size: 0.75rem; margin-bottom: 0.2rem; }
+        .stat span.val { font-variant-numeric: tabular-nums; font-size: 1.1rem; }
+        .err-line { color: var(--danger); font-size: 0.85rem; margin-top: 0.35rem; }
+        .chart-wrap { position: relative; height: 220px; margin-top: 0.5rem; }
+        .log-panel { margin-top: 0.75rem; }
+        .log-panel > label { display: block; color: var(--muted); font-size: 0.75rem; margin-bottom: 0.35rem; }
+        .log-feed {
+            font-family: ui-monospace, Consolas, monospace;
+            font-size: 0.78rem;
+            line-height: 1.45;
+            max-height: 220px;
+            overflow-y: auto;
+            background: #121922;
+            border-radius: 8px;
+            padding: 0.5rem 0.65rem;
+            border: 1px solid #2d3848;
+        }
+        .log-line { padding: 0.12rem 0; white-space: pre-wrap; word-break: break-word; }
+        .log-line + .log-line { border-top: 1px solid rgba(45, 56, 72, 0.6); }
+        .level-ERROR { color: var(--danger); }
+        .level-WARN { color: var(--warn); }
+        .level-INFO { color: #79c0ff; }
+        .empty { color: var(--muted); padding: 2rem; text-align: center; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>分布式日志采集 · 实时分析与异常监控</h1>
+    <div class="meta">
+        WebSocket: <span id="conn" class="conn-bad">连接中…</span>
+        · 消息中间件: RabbitMQ（日志 fanout / 分析 fanout / 告警 fanout）
+    </div>
+</header>
+<main>
+    <div class="global-stats">
+        <div class="pill">全局严重告警推送次数: <strong id="severe-total">0</strong></div>
+        <div class="pill">设备数: <strong id="device-count">0</strong></div>
+    </div>
+    <div id="devices" class="devices"></div>
+    <p class="empty" id="placeholder">等待采集节点与分析服务推送数据…</p>
+</main>
+<script>
+    const charts = new Map();
+
+    function fmtTime(epochSec) {
+        const d = new Date(epochSec * 1000);
+        return d.toLocaleTimeString();
+    }
+
+    function render(snapshot) {
+        document.getElementById('severe-total').textContent = snapshot.severeAlertsTotal ?? 0;
+        const list = snapshot.devices || [];
+        document.getElementById('device-count').textContent = list.length;
+        const root = document.getElementById('devices');
+        const ph = document.getElementById('placeholder');
+        if (list.length) ph.style.display = 'none';
+        else ph.style.display = 'block';
+
+        const seen = new Set();
+        for (const d of list) {
+            seen.add(d.deviceId);
+            let card = document.getElementById('card-' + slugId(d.deviceId));
+            if (!card) {
+                card = document.createElement('section');
+                card.className = 'device-card';
+                card.id = 'card-' + slugId(d.deviceId);
+                card.innerHTML = `
+                    <h2><span class="title-id"></span>
+                        <span class="badge badge-off severe-badge">严重告警: 否</span></h2>
+                    <div class="stats-grid">
+                        <div class="stat"><label>WARN 占比 (分析)</label><span class="val warn-pct">—</span></div>
+                        <div class="stat"><label>ERROR 占比 (分析)</label><span class="val err-pct">—</span></div>
+                        <div class="stat"><label>本设备严重告警次数</label><span class="val severe-n">0</span></div>
+                    </div>
+                    <div class="stat"><label>最近 ERROR</label>
+                        <div class="last-err">—</div>
+                    </div>
+                    <div class="stat"><label>最近严重告警说明</label>
+                        <div class="severe-msg muted">—</div>
+                    </div>
+                    <div class="chart-wrap"><canvas></canvas></div>
+                    <div class="log-panel stat" style="grid-column: 1 / -1;">
+                        <label>最近日志（时间顺序，最新在底部，最多约 120 条）</label>
+                        <div class="log-feed" aria-live="polite"></div>
+                    </div>
+                `;
+                root.appendChild(card);
+                card.querySelector('.title-id').textContent = d.deviceId;
+                const canvas = card.querySelector('canvas');
+                charts.set(d.deviceId, new Chart(canvas, {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [
+                            {
+                                label: 'WARN 条数 / 秒',
+                                data: [],
+                                borderColor: '#d29922',
+                                backgroundColor: 'rgba(210, 153, 34, 0.1)',
+                                tension: 0.2,
+                                fill: true
+                            },
+                            {
+                                label: 'ERROR 条数 / 秒',
+                                data: [],
+                                borderColor: '#f85149',
+                                backgroundColor: 'rgba(248, 81, 73, 0.08)',
+                                tension: 0.2,
+                                fill: true
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: { mode: 'index', intersect: false },
+                        plugins: {
+                            legend: { labels: { color: '#8b9cb3' } },
+                            title: {
+                                display: true,
+                                text: 'WARN / ERROR 条数随时间（按秒聚合）',
+                                color: '#8b9cb3',
+                                font: { size: 12 }
+                            }
+                        },
+                        scales: {
+                            x: {
+                                ticks: { color: '#8b9cb3', maxRotation: 45 },
+                                grid: { color: 'rgba(45, 56, 72, 0.5)' }
+                            },
+                            y: {
+                                beginAtZero: true,
+                                ticks: { color: '#8b9cb3', precision: 0 },
+                                grid: { color: 'rgba(45, 56, 72, 0.5)' }
+                            }
+                        }
+                    }
+                }));
+            }
+            const badge = card.querySelector('.severe-badge');
+            badge.textContent = d.severeWarningActive ? '严重告警: 是' : '严重告警: 否';
+            badge.className = 'badge severe-badge ' + (d.severeWarningActive ? 'badge-on' : 'badge-off');
+            card.querySelector('.warn-pct').textContent =
+                (d.warnPercent != null ? d.warnPercent.toFixed(2) : '—') + '%';
+            card.querySelector('.err-pct').textContent =
+                (d.errorPercent != null ? d.errorPercent.toFixed(2) : '—') + '%';
+            card.querySelector('.severe-n').textContent = d.severeWarningsForDevice ?? 0;
+            const lastErr = card.querySelector('.last-err');
+            if (d.lastErrorMessage) {
+                lastErr.innerHTML = escapeHtml(d.lastErrorMessage) +
+                    (d.lastErrorTimestamp ? ' <span style="color:#8b9cb3">@' + escapeHtml(d.lastErrorTimestamp) + '</span>' : '');
+            } else {
+                lastErr.textContent = '暂无 ERROR';
+            }
+            const sm = card.querySelector('.severe-msg');
+            sm.textContent = d.lastSevereMessage || '—';
+
+            const series = d.warnErrorSeries || [];
+            const ch = charts.get(d.deviceId);
+            if (ch) {
+                ch.data.labels = series.map(p => fmtTime(p.epochSecond));
+                ch.data.datasets[0].data = series.map(p => p.warnCount);
+                ch.data.datasets[1].data = series.map(p => p.errorCount);
+                ch.update('none');
+            }
+            const feed = card.querySelector('.log-feed');
+            if (feed) {
+                const logs = d.recentLogs || [];
+                const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 8;
+                feed.innerHTML = logs.map(l => {
+                    const lvl = (l.logLevel || 'INFO').toUpperCase();
+                    let css = 'level-INFO';
+                    if (lvl === 'ERROR') css = 'level-ERROR';
+                    else if (lvl === 'WARN') css = 'level-WARN';
+                    const ts = escapeHtml(l.timestamp || '');
+                    const lv = escapeHtml(l.logLevel || '');
+                    const msg = escapeHtml(l.message || '');
+                    return '<div class="log-line ' + css + '">' + ts + ' [' + lv + '] ' + msg + '</div>';
+                }).join('');
+                if (atBottom || logs.length <= 1) {
+                    feed.scrollTop = feed.scrollHeight;
+                }
+            }
+        }
+        for (const id of [...charts.keys()]) {
+            if (!seen.has(id)) {
+                const el = document.getElementById('card-' + slugId(id));
+                if (el) el.remove();
+                charts.get(id)?.destroy();
+                charts.delete(id);
+            }
+        }
+    }
+
+    function slugId(deviceId) {
+        return deviceId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    }
+
+    function escapeHtml(s) {
+        const div = document.createElement('div');
+        div.textContent = s;
+        return div.innerHTML;
+    }
+
+    function connectWs() {
+        const sock = new SockJS(location.origin + '/ws');
+        const stomp = Stomp.over(sock);
+        stomp.debug = null;
+        stomp.connect({}, () => {
+            document.getElementById('conn').textContent = '已连接';
+            document.getElementById('conn').className = 'conn-ok';
+            stomp.subscribe('/topic/dashboard', (msg) => render(JSON.parse(msg.body)));
+        }, () => {
+            document.getElementById('conn').textContent = '断开 / 错误';
+            document.getElementById('conn').className = 'conn-bad';
+        });
+    }
+
+    fetch('/api/snapshot').then(r => r.json()).then(render).catch(() => {});
+    connectWs();
+</script>
+</body>
+</html>
